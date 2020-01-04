@@ -2,6 +2,8 @@
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/timer.h>
+#include <libopencm3/stm32/spi.h>
+#include <libopencm3/stm32/dma.h>
 #include <libopencm3/cm3/nvic.h>
 
 #define RCCLEDPORT (RCC_GPIOC)
@@ -28,6 +30,9 @@
 #define HORIZSYNCPULSEWIDTH (144) // 144/72Mhz = 2us
 #define SYNCPLUSPORCH (280)       // 280/72Mhz = 3.88889us
 
+static uint8_t lineBuffer[52];
+static uint8_t emptyBuffer[52];
+
 static void rcc_setup(void)
 {
     // System clock
@@ -42,8 +47,8 @@ static void rcc_setup(void)
     rcc_periph_clock_enable(RCC_TIM1);
 
     // SPI & DMA for data
-    //rcc_periph_clock_enable(RCC_SPI1);
-    //rcc_periph_clock_enable(RCC_DMA1); // Only a single DMA -> don't need to stress like the F4's
+    rcc_periph_clock_enable(RCC_SPI1);
+    rcc_periph_clock_enable(RCC_DMA1);
 }
 
 static void gpio_setup(void)
@@ -66,10 +71,62 @@ static void gpio_setup(void)
                   GPIO_CNF_OUTPUT_PUSHPULL,
                   GPIO1);
 
+    // Toggle the pin to prove it works
+    gpio_set_mode(GPIOA,
+                  GPIO_MODE_OUTPUT_50_MHZ,
+                  GPIO_CNF_OUTPUT_PUSHPULL,
+                  GPIO7);
+    for (int repeat = 1; repeat < 100; repeat++)
+    {
+        gpio_toggle(GPIOA, GPIO7);
+        for (int i = 1; i < 10000; i++)
+        {
+            __asm__("nop");
+        }
+    }
+
     // Setup data output pins
     //  Uses SPI DMA -> a MOSI pin
-    //  PA7
-    gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, GPIO7);
+    //  PA7 is MOSI
+    //  PA5 is SCK
+    gpio_set_mode(GPIOA,
+                  GPIO_MODE_OUTPUT_50_MHZ,
+                  GPIO_CNF_OUTPUT_ALTFN_PUSHPULL,
+                  GPIO7 | GPIO5);
+}
+
+static void spiDma_setup(void)
+{
+    // Reset: CR1 cleared, SPI disabled
+    spi_reset(SPI1);
+
+    // Use 8 bit transfers
+    spi_init_master(SPI1,
+                    SPI_CR1_BAUDRATE_FPCLK_DIV_2, // 72MHz/2 = 36MHz required for pixel clock
+                    SPI_CR1_CPOL_CLK_TO_0_WHEN_IDLE,
+                    SPI_CR1_CPHA_CLK_TRANSITION_1,
+                    SPI_CR1_DFF_8BIT,
+                    SPI_CR1_MSBFIRST);
+
+    // Set to software NSS
+    // Must do, despite ignoring it entirely
+    spi_enable_software_slave_management(SPI1);
+    spi_set_nss_high(SPI1);
+
+    // Tell SPI we are using DMA
+    spi_enable_tx_dma(SPI1);
+
+    // Enable SPI
+    spi_enable(SPI1);
+
+    // Setup DMA
+    dma_channel_reset(DMA1, DMA_CHANNEL3);
+
+    dma_set_peripheral_address(DMA1, DMA_CHANNEL3, (uint32_t)&SPI1_DR);
+    dma_enable_memory_increment_mode(DMA1, DMA_CHANNEL3);
+    dma_set_peripheral_size(DMA1, DMA_CHANNEL3, DMA_CCR_PSIZE_8BIT);
+    dma_set_memory_size(DMA1, DMA_CHANNEL3, DMA_CCR_MSIZE_8BIT);
+    dma_set_read_from_memory(DMA1, DMA_CHANNEL3);
 }
 
 static void timer_setup(void)
@@ -126,6 +183,14 @@ int main(void)
 {
     rcc_setup();
     gpio_setup();
+    spiDma_setup();
+
+    for (int i = 1; i < 52; i++)
+    {
+        lineBuffer[i] = i;
+        emptyBuffer[i] = 0;
+    }
+
     timer_setup();
 
     while (1)
@@ -145,6 +210,10 @@ void tim1_cc_isr(void)
 
     if (timer_get_flag(TIM1, TIM_SR_CC2IF))
     {
+        // Clear compare interrupt flag.
+        timer_clear_flag(TIM1, TIM_SR_CC2IF);
+
+        // Increment line, and process
         scanlineNumber++;
 
         switch (scanlineNumber)
@@ -161,13 +230,20 @@ void tim1_cc_isr(void)
             stretchLine = 0;
             opLine = 0;
             readLine = 0;
-            //TODO: More logic
+            // Send an empty line (default line buffer)
+            dma_disable_channel(DMA1, DMA_CHANNEL3);
+            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
+            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            dma_enable_channel(DMA1, DMA_CHANNEL3);
             break;
 
         case FRAME_OUTPUT_START ... FRAME_OUTPUT_END:
             // Send data
-            gpio_set(GPIOA, GPIO7);
-            gpio_clear(GPIOA, GPIO7);
+            // Send an empty line (default line buffer)
+            dma_disable_channel(DMA1, DMA_CHANNEL3);
+            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
+            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            dma_enable_channel(DMA1, DMA_CHANNEL3);
 
             // Is it time for the next line?
             //  Remember we repeat lines
@@ -185,14 +261,15 @@ void tim1_cc_isr(void)
 
         case (FRAME_OUTPUT_END + 1)...(FRAME_END - 1):
             // Send blanking
+            dma_disable_channel(DMA1, DMA_CHANNEL3);
+            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
+            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            dma_enable_channel(DMA1, DMA_CHANNEL3);
             break;
 
         case FRAME_END:
             scanlineNumber = 0;
             break;
         }
-
-        // Clear compare interrupt flag.
-        timer_clear_flag(TIM1, TIM_SR_CC2IF);
     }
 }
