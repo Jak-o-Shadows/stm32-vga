@@ -185,10 +185,10 @@ int main(void)
     gpio_setup();
     spiDma_setup();
 
-    for (int i = 1; i < 52; i++)
+    for (int i = 0; i < 52; i++)
     {
         lineBuffer[i] = i;
-        emptyBuffer[i] = 0;
+        emptyBuffer[i] = 255;
     }
 
     timer_setup();
@@ -231,40 +231,64 @@ void tim1_cc_isr(void)
             opLine = 0;
             readLine = 0;
             // Send an empty line (default line buffer)
-            dma_disable_channel(DMA1, DMA_CHANNEL3);
-            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
-            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            dma_enable_channel(DMA1, DMA_CHANNEL3);
+            // Manual Inlining for speed
+            //dma_disable_channel(DMA1, DMA_CHANNEL3);
+            DMA_CCR(DMA1, DMA_CHANNEL3) &= ~DMA_CCR_EN;
+
+            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
+            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)emptyBuffer;
+
+            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
+
+            //dma_enable_channel(DMA1, DMA_CHANNEL3);
+            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
+
             break;
 
         case FRAME_OUTPUT_START ... FRAME_OUTPUT_END:
             // Send data
-            // Send an empty line (default line buffer)
-            dma_disable_channel(DMA1, DMA_CHANNEL3);
-            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
-            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            dma_enable_channel(DMA1, DMA_CHANNEL3);
+            // Manual Inlining for speed
+            //dma_disable_channel(DMA1, DMA_CHANNEL3);
+            DMA_CCR(DMA1, DMA_CHANNEL3) &= ~DMA_CCR_EN;
+
+            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
+            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)lineBuffer;
+
+            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
 
             // Is it time for the next line?
             //  Remember we repeat lines
             if (stretchLine++ == YSTRETCH)
             {
+                // Need to prepare a new line of data
+                // Enable Transfer complete interrupt
+
                 // Swap to newline
                 readLine = !readLine; // Swap double buffered line
                 stretchLine = 0;
             }
             else
             {
-                // blah? TODO: Fix
+                // Don't do anything (send the same data)
             }
+
+            // Enable DMA and transfer
+            //dma_enable_channel(DMA1, DMA_CHANNEL3);
+            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
             break;
 
         case (FRAME_OUTPUT_END + 1)...(FRAME_END - 1):
             // Send blanking
-            dma_disable_channel(DMA1, DMA_CHANNEL3);
-            dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
-            dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            dma_enable_channel(DMA1, DMA_CHANNEL3);
+            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
+            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)lineBuffer;
+
+            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
+            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
+
+            //dma_enable_channel(DMA1, DMA_CHANNEL3);
+            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
             break;
 
         case FRAME_END:
