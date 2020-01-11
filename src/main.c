@@ -17,7 +17,7 @@
 #define XOFFSET 0
 #define YEXTENT 576
 
-#define YSTRETCH 1
+#define YSTRETCH 10
 
 #define FRAME_START 0
 #define FRAME_BACKPORCH 2                                   // Start of backporch and blanking
@@ -30,8 +30,12 @@
 #define HORIZSYNCPULSEWIDTH (144) // 144/72Mhz = 2us
 #define SYNCPLUSPORCH (280)       // 280/72Mhz = 3.88889us
 
-static uint8_t lineBuffer[52];
-static uint8_t emptyBuffer[52];
+#define XSIZE 100
+
+static uint8_t lineBuffer1[XSIZE];
+static uint8_t lineBuffer2[XSIZE];
+static uint8_t emptyBuffer[XSIZE];
+static const uint32_t buffers[] = {(uint32_t)&lineBuffer1, (uint32_t)&lineBuffer2};
 
 static void rcc_setup(void)
 {
@@ -127,6 +131,8 @@ static void spiDma_setup(void)
     dma_set_peripheral_size(DMA1, DMA_CHANNEL3, DMA_CCR_PSIZE_8BIT);
     dma_set_memory_size(DMA1, DMA_CHANNEL3, DMA_CCR_MSIZE_8BIT);
     dma_set_read_from_memory(DMA1, DMA_CHANNEL3);
+
+    dma_disable_channel(DMA1, DMA_CHANNEL3);
 }
 
 static void timer_setup(void)
@@ -185,11 +191,26 @@ int main(void)
     gpio_setup();
     spiDma_setup();
 
-    for (int i = 0; i < 52; i++)
+    int num = 0;
+    for (int i = 0; i < XSIZE; i++)
     {
-        lineBuffer[i] = i;
-        emptyBuffer[i] = 255;
+        if (i % 2)
+        {
+            num = 0xFF;
+        }
+        else
+        {
+            num = 0;
+        }
+        lineBuffer1[i] = num;
+        lineBuffer2[i] = num;
+
+        emptyBuffer[i] = 0;
     }
+    lineBuffer1[0] = 0xFE;
+    lineBuffer1[XSIZE - 1] = 0x7F;
+    lineBuffer2[0] = 0xFE;
+    lineBuffer2[XSIZE - 1] = 0x7F;
 
     timer_setup();
 
@@ -200,100 +221,121 @@ int main(void)
     return 0;
 }
 
-void tim1_cc_isr(void)
+__attribute__((__section__(".ramprog"))) void tim1_cc_isr(void)
 {
+    // Note: This function is placed into RAM, instead of flash. Does this actually do anything? Quick work with a scope suggests that it doesn't really make any difference
     static uint16_t scanlineNumber = 0;
 
     static uint16_t stretchLine = 0;
     static uint16_t opLine = 0;
     static uint16_t readLine = 0;
 
-    if (timer_get_flag(TIM1, TIM_SR_CC2IF))
+    //if (timer_get_flag(TIM1, TIM_SR_CC2IF))
+    //{
+    // Clear compare interrupt flag.
+    //timer_clear_flag(TIM1, TIM_SR_CC2IF);
+    TIM_SR(TIM1) &= ~TIM_SR_CC2IF;
+
+    //dma_disable_channel(DMA1, DMA_CHANNEL3);
+    DMA_CCR(DMA1, DMA_CHANNEL3) &= ~DMA_CCR_EN;
+
+    // Increment line, and process
+    switch (scanlineNumber++)
     {
-        // Clear compare interrupt flag.
-        timer_clear_flag(TIM1, TIM_SR_CC2IF);
+    case FRAME_START ...(FRAME_BACKPORCH - 1):
+        // The start of frame - turn on VSYNC
+        //gpio_set(GPIOA, GPIO1);
+        GPIO_BSRR(GPIOA) = GPIO1;
+        break;
 
-        // Increment line, and process
-        scanlineNumber++;
+    case FRAME_BACKPORCH ...(FRAME_OUTPUT_START - 1):
+        // Sync pulse finished - top blanking begins
+        //gpio_clear(GPIOA, GPIO1);
+        GPIO_BSRR(GPIOA) = (GPIO1 << 16);
 
-        switch (scanlineNumber)
+        // Initialise frame variables
+        stretchLine = 0;
+        opLine = 0;
+        readLine = 0;
+        // Send an empty line (default line buffer)
+        // Manual Inlining for speed
+
+        //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
+        DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)emptyBuffer;
+
+        //dma_set_number_of_data(DMA1, DMA_CHANNEL3, XSIZE);
+        DMA_CNDTR(DMA1, DMA_CHANNEL3) = XSIZE;
+
+        //dma_enable_channel(DMA1, DMA_CHANNEL3);
+        DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
+
+        break;
+
+    case FRAME_OUTPUT_START ... FRAME_OUTPUT_END:
+        // Send data
+        // Manual Inlining for speed
+
+        //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
+        DMA_CMAR(DMA1, DMA_CHANNEL3) = buffers[readLine];
+
+        //dma_set_number_of_data(DMA1, DMA_CHANNEL3, XSIZE);
+        DMA_CNDTR(DMA1, DMA_CHANNEL3) = XSIZE;
+
+        // Is it time for the next line?
+        //  Remember we repeat lines
+        // Note that the branches must be same length. Hence NOPS
+        // the length of each branch more similar.
+        if (stretchLine++ == YSTRETCH)
         {
-        case FRAME_START ...(FRAME_BACKPORCH - 1):
-            // The start of frame - turn on VSYNC
-            gpio_set(GPIOA, GPIO1);
-            break;
+            // Need to prepare a new line of data
+            // Enable Transfer complete interrupt
 
-        case FRAME_BACKPORCH ...(FRAME_OUTPUT_START - 1):
-            // Sync pulse finished - top blanking begins
-            gpio_clear(GPIOA, GPIO1);
-            // Initialise frame variables
+            // Swap to newline
+            readLine = !readLine; // Swap double buffered line
             stretchLine = 0;
-            opLine = 0;
-            readLine = 0;
-            // Send an empty line (default line buffer)
-            // Manual Inlining for speed
-            //dma_disable_channel(DMA1, DMA_CHANNEL3);
-            DMA_CCR(DMA1, DMA_CHANNEL3) &= ~DMA_CCR_EN;
-
-            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
-            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)emptyBuffer;
-
-            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
-
-            //dma_enable_channel(DMA1, DMA_CHANNEL3);
-            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
-
-            break;
-
-        case FRAME_OUTPUT_START ... FRAME_OUTPUT_END:
-            // Send data
-            // Manual Inlining for speed
-            //dma_disable_channel(DMA1, DMA_CHANNEL3);
-            DMA_CCR(DMA1, DMA_CHANNEL3) &= ~DMA_CCR_EN;
-
-            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
-            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)lineBuffer;
-
-            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
-
-            // Is it time for the next line?
-            //  Remember we repeat lines
-            if (stretchLine++ == YSTRETCH)
-            {
-                // Need to prepare a new line of data
-                // Enable Transfer complete interrupt
-
-                // Swap to newline
-                readLine = !readLine; // Swap double buffered line
-                stretchLine = 0;
-            }
-            else
-            {
-                // Don't do anything (send the same data)
-            }
-
-            // Enable DMA and transfer
-            //dma_enable_channel(DMA1, DMA_CHANNEL3);
-            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
-            break;
-
-        case (FRAME_OUTPUT_END + 1)...(FRAME_END - 1):
-            // Send blanking
-            //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)lineBuffer);
-            DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)lineBuffer;
-
-            //dma_set_number_of_data(DMA1, DMA_CHANNEL3, 52);
-            DMA_CNDTR(DMA1, DMA_CHANNEL3) = 52;
-
-            //dma_enable_channel(DMA1, DMA_CHANNEL3);
-            DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
-            break;
-
-        case FRAME_END:
-            scanlineNumber = 0;
-            break;
         }
+        else
+        {
+            // Send the same data
+
+            // As the branches must be the same length, (otherwise you get jitter),
+            //  insert some NOPs here. Note that this is an empircally
+            //  found number of NOPS
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+            __asm__("nop");
+        }
+
+        // Enable DMA and transfer
+        //dma_enable_channel(DMA1, DMA_CHANNEL3);
+        DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
+
+        break;
+
+    case (FRAME_OUTPUT_END + 1)...(FRAME_END - 1):
+        // Send blanking
+
+        //dma_set_memory_address(DMA1, DMA_CHANNEL3, (uint32_t)emptyBuffer);
+        DMA_CMAR(DMA1, DMA_CHANNEL3) = (uint32_t)emptyBuffer;
+
+        //dma_set_number_of_data(DMA1, DMA_CHANNEL3, XSIZE);
+        DMA_CNDTR(DMA1, DMA_CHANNEL3) = XSIZE;
+
+        //dma_enable_channel(DMA1, DMA_CHANNEL3);
+        DMA_CCR(DMA1, DMA_CHANNEL3) |= DMA_CCR_EN;
+        break;
+
+    case FRAME_END:
+        scanlineNumber = 0;
+        break;
     }
+    //}
 }
